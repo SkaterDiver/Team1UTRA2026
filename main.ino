@@ -3,10 +3,15 @@
  * Arduino Uno R4
  *
  * ALGORITHM: Edge-following along RIGHT side of line
- * - Robot stays on WHITE, to the RIGHT of the black line
- * - On BLACK (hit line): turn LEFT (back to white on right)
- * - On WHITE (normal): curve RIGHT (toward line on our left)
+ * - Robot stays on WHITE, to the RIGHT of the trackable line
+ * - Tracks BLACK line (calibrated) AND optional secondary RGB color
+ * - On LINE (black or secondary color): turn LEFT (back to white on right)
+ * - On WHITE (off line): curve RIGHT (toward line on our left)
  * - On OBSTACLE: detour around, then curve back to line
+ *
+ * SECONDARY COLOR: Set SECONDARY_COLOR to track additional colors:
+ *   0 = disabled, 1 = RED, 2 = GREEN, 3 = BLUE
+ *   Color is detected when it's significantly more dominant than others
  *
  * PAUSE/RUN: Press RESET to toggle between paused and running
  * Robot must start on the BLACK line for auto-calibration
@@ -43,19 +48,25 @@ const int IR_PIN = 2;
 // Motor speeds (0-255)
 const int BASE_SPEED = 80;        // Base forward speed
 const int TURN_REDUCTION = 30;    // How much to slow inner wheel when ON line (gentle)
-const int RETURN_TURN_REDUCTION = 45; // Sharper turn when OFF line (returning to it)
+const int RETURN_TURN_REDUCTION = 15; // Gentler curve when OFF line (returning to it)
 const int RIGHT_MOTOR_BOOST = 10; // Compensation for weaker right motor
 
 // Color detection
 const int BLACK_TOLERANCE = 20;   // +/- from calibrated value counts as black
 
+// Secondary color tracking (treats this color same as black)
+// Set to 0=NONE, 1=RED, 2=GREEN, 3=BLUE
+const int SECONDARY_COLOR = 2;    // 2 = GREEN (set to 0 to disable)
+const float COLOR_DOMINANCE = 1.5; // Secondary color must be this many times stronger than others
+
 // Obstacle avoidance
 const int DETOUR_PIVOT_MS = 400;  // How long to pivot right when obstacle seen
 const int DETOUR_FORWARD_MS = 300; // How long to go forward after pivot
-const int PIVOT_SPEED = 90;       // Speed during pivot turns
+const int PIVOT_SPEED = 100;      // Speed during pivot turns
 
 // Sharp turn handling
-const unsigned long WHITE_ESCALATE_MS = 500; // If on white this long, escalate to pivot
+const unsigned long WHITE_ESCALATE_MS = 1000; // If on white this long, escalate to pivot (increased)
+const int MIN_PIVOT_MS = 30;                  // Minimum time to pivot when hitting black (reduced)
 
 // ==================== STATE ====================
 
@@ -84,8 +95,19 @@ void setup() {
 
   // Print status
   Serial.println("====================");
-  Serial.println("LINE FOLLOWER v2.0");
+  Serial.println("LINE FOLLOWER v3.0");
+  Serial.println("+ Secondary Color");
   Serial.println("====================");
+
+  // Print secondary color config
+  if (SECONDARY_COLOR > 0) {
+    Serial.print("Secondary color: ");
+    switch (SECONDARY_COLOR) {
+      case 1: Serial.println("RED"); break;
+      case 2: Serial.println("GREEN"); break;
+      case 3: Serial.println("BLUE"); break;
+    }
+  }
 
   if (isPaused) {
     Serial.println("");
@@ -145,13 +167,33 @@ void loop() {
 // Test sensor without motors - move robot by hand to see values
 void testSensor() {
   stopMotors();
-  int val = readColorSensor();
-  Serial.print("Sensor: ");
-  Serial.print(val);
-  Serial.print(" | Cal: ");
-  Serial.print(calibratedBlack);
+
+  int clearVal = readColorSensor();
+  int red = readRedChannel();
+  int green = readGreenChannel();
+  int blue = readBlueChannel();
+
+  Serial.print("Clear:");
+  Serial.print(clearVal);
+  Serial.print(" R:");
+  Serial.print(red);
+  Serial.print(" G:");
+  Serial.print(green);
+  Serial.print(" B:");
+  Serial.print(blue);
+
   Serial.print(" | ");
-  Serial.println(isBlack(val) ? "BLACK" : "WHITE");
+  if (isBlack(clearVal)) {
+    Serial.print("BLACK");
+  } else if (SECONDARY_COLOR > 0 && isSecondaryColorDetected()) {
+    Serial.print("SEC-COLOR");
+  } else {
+    Serial.print("WHITE");
+  }
+
+  Serial.print(" | OnLine:");
+  Serial.println(isOnLine() ? "YES" : "NO");
+
   delay(200);
 }
 
@@ -177,54 +219,52 @@ void testMotors() {
 // ==================== LINE FOLLOWING ====================
 
 void followLine() {
-  int sensorValue = readColorSensor();
-  bool onBlack = isBlack(sensorValue);
+  // Check if on trackable line (black OR secondary color)
+  bool onLine = isOnLine();
 
-  // Track how long we've been on white (for sharp turn handling)
-  if (onBlack) {
+  // Track how long we've been off the line (for sharp turn handling)
+  if (onLine) {
     wasOnBlack = true;
     whiteStartTime = 0;  // Reset white timer
   } else {
     if (wasOnBlack) {
-      // Just transitioned to white
+      // Just transitioned off the line
       whiteStartTime = millis();
       wasOnBlack = false;
     }
   }
 
-  // Calculate time on white
-  unsigned long timeOnWhite = 0;
-  if (!onBlack && whiteStartTime > 0) {
-    timeOnWhite = millis() - whiteStartTime;
+  // Calculate time off line
+  unsigned long timeOffLine = 0;
+  if (!onLine && whiteStartTime > 0) {
+    timeOffLine = millis() - whiteStartTime;
   }
 
   // Debug output
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 200) {
-    Serial.print("Val:");
-    Serial.print(sensorValue);
-    Serial.print(" Cal:");
-    Serial.print(calibratedBlack);
-    Serial.print("±");
-    Serial.print(BLACK_TOLERANCE);
+    Serial.print("OnLine:");
+    Serial.print(onLine ? "YES" : "NO");
     Serial.print(" -> ");
-    if (onBlack) {
-      Serial.println("BLACK(turn-L)");
-    } else if (timeOnWhite > WHITE_ESCALATE_MS) {
-      Serial.println("WHITE(PIVOT-R!)");
+    if (onLine) {
+      Serial.println("LINE(turn-L)");
+    } else if (timeOffLine > WHITE_ESCALATE_MS) {
+      Serial.println("OFF(PIVOT-R!)");
     } else {
-      Serial.println("WHITE(curve-R)");
+      Serial.println("OFF(curve-R)");
     }
     lastPrint = millis();
   }
 
-  if (onBlack) {
+  if (onLine) {
     // Hit the line - turn LEFT (away from line, back to white on right)
+    // Use minimum pivot time to ensure robot actually moves
     pivotRight();
+    delay(MIN_PIVOT_MS);
   } else {
-    // On white - turn toward the line (which is on our right)
-    if (timeOnWhite > WHITE_ESCALATE_MS) {
-      // Been on white too long (sharp turn?) - aggressive pivot to find line
+    // Off line - turn toward the line (which is on our left)
+    if (timeOffLine > WHITE_ESCALATE_MS) {
+      // Been off line too long (sharp turn?) - aggressive pivot to find line
       pivotLeft();
     } else {
       // Normal curve toward line
@@ -238,14 +278,15 @@ void followLine() {
 void handleObstacle() {
   Serial.println("");
   Serial.println("*** OBSTACLE DETECTED ***");
-  Serial.println("Taking detour...");
+  Serial.println("Taking detour to the right...");
 
   // Stop
   stopMotors();
   delay(100);
 
-  // Pivot to go around obstacle (cross over line temporarily)
-  pivotRight();
+  // Pivot RIGHT physically (away from line, into open space)
+  // pivotLeft() produces physical right turn due to motor wiring
+  pivotLeft();
   delay(DETOUR_PIVOT_MS);
 
   // Go forward to clear the obstacle area
@@ -253,8 +294,8 @@ void handleObstacle() {
   delay(DETOUR_FORWARD_MS);
 
   // Resume normal line following
-  // Robot will be on white, line is now to the right
-  // curveLeft() will bring it back to the line
+  // Robot is on white far to the right, line is to the left
+  // curveLeft() will bring it back toward the line
   Serial.println("Resuming line following...");
   Serial.println("");
 }
@@ -365,6 +406,28 @@ int readColorSensor() {
   return pulseIn(CS_OUT, LOW, 50000);
 }
 
+// Read individual color channels (lower value = more of that color)
+int readRedChannel() {
+  digitalWrite(CS_S2, LOW);
+  digitalWrite(CS_S3, LOW);
+  delay(5);
+  return pulseIn(CS_OUT, LOW, 50000);
+}
+
+int readGreenChannel() {
+  digitalWrite(CS_S2, HIGH);
+  digitalWrite(CS_S3, HIGH);
+  delay(5);
+  return pulseIn(CS_OUT, LOW, 50000);
+}
+
+int readBlueChannel() {
+  digitalWrite(CS_S2, LOW);
+  digitalWrite(CS_S3, HIGH);
+  delay(5);
+  return pulseIn(CS_OUT, LOW, 50000);
+}
+
 bool isBlack(int value) {
   // If sensor returned 0 (timeout/error), treat as white (not on line)
   if (value == 0) {
@@ -374,6 +437,60 @@ bool isBlack(int value) {
   // Check if value is within tolerance of calibrated black
   int diff = abs(value - calibratedBlack);
   return (diff <= BLACK_TOLERANCE);
+}
+
+// Check if the secondary color is detected
+// Returns true if the configured color is significantly more dominant than others
+bool isSecondaryColorDetected() {
+  if (SECONDARY_COLOR == 0) {
+    return false;  // Secondary color tracking disabled
+  }
+
+  int red = readRedChannel();
+  int green = readGreenChannel();
+  int blue = readBlueChannel();
+
+  // Handle sensor errors
+  if (red == 0 || green == 0 || blue == 0) {
+    return false;
+  }
+
+  // For TCS3200: LOWER pulse width = MORE of that color
+  // So we check if the target color has a significantly LOWER value
+
+  switch (SECONDARY_COLOR) {
+    case 1:  // RED
+      // Red must be significantly lower (stronger) than green and blue
+      return (red < green / COLOR_DOMINANCE) && (red < blue / COLOR_DOMINANCE);
+
+    case 2:  // GREEN
+      // Green must be significantly lower (stronger) than red and blue
+      return (green < red / COLOR_DOMINANCE) && (green < blue / COLOR_DOMINANCE);
+
+    case 3:  // BLUE
+      // Blue must be significantly lower (stronger) than red and green
+      return (blue < red / COLOR_DOMINANCE) && (blue < green / COLOR_DOMINANCE);
+
+    default:
+      return false;
+  }
+}
+
+// Combined check: is the sensor on a trackable line (black OR secondary color)
+bool isOnLine() {
+  int clearValue = readColorSensor();
+
+  // First check for black (fast check)
+  if (isBlack(clearValue)) {
+    return true;
+  }
+
+  // Then check for secondary color if enabled
+  if (SECONDARY_COLOR > 0 && isSecondaryColorDetected()) {
+    return true;
+  }
+
+  return false;
 }
 
 void autoCalibrate() {
