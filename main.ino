@@ -46,18 +46,19 @@ const int IR_PIN = 2;
 // Adjust these to tune the robot's behavior
 
 // Motor speeds (0-255)
-const int BASE_SPEED = 80;        // Base forward speed
+const int BASE_SPEED = 70;        // Base forward speed
 const int TURN_REDUCTION = 30;    // How much to slow inner wheel when ON line (gentle)
-const int RETURN_TURN_REDUCTION = 15; // Gentler curve when OFF line (returning to it)
+const int RETURN_TURN_REDUCTION = 25; // Curve sharpness when OFF line (returning to it)
 const int RIGHT_MOTOR_BOOST = 10; // Compensation for weaker right motor
+const int LEFT_MOTOR_REDUCTION = 10; // Reduce left motor power (robot drifts right)
 
 // Color detection
 const int BLACK_TOLERANCE = 20;   // +/- from calibrated value counts as black
 
 // Secondary color tracking (treats this color same as black)
 // Set to 0=NONE, 1=RED, 2=GREEN, 3=BLUE
-const int SECONDARY_COLOR = 2;    // 2 = GREEN (set to 0 to disable)
-const float COLOR_DOMINANCE = 1.5; // Secondary color must be this many times stronger than others
+const int SECONDARY_COLOR = 1;    // 1 = RED (set to 0 to disable)
+const float COLOR_DOMINANCE = 1.2; // Secondary color must be this many times stronger (lower = more sensitive)
 
 // Obstacle avoidance
 const int DETOUR_PIVOT_MS = 400;  // How long to pivot right when obstacle seen
@@ -65,8 +66,8 @@ const int DETOUR_FORWARD_MS = 300; // How long to go forward after pivot
 const int PIVOT_SPEED = 100;      // Speed during pivot turns
 
 // Sharp turn handling
-const unsigned long WHITE_ESCALATE_MS = 1000; // If on white this long, escalate to pivot (increased)
-const int MIN_PIVOT_MS = 30;                  // Minimum time to pivot when hitting black (reduced)
+const unsigned long WHITE_ESCALATE_MS = 3000; // If off line this long, escalate to pivot (3 sec)
+const int MIN_PIVOT_MS = 30;                  // Minimum time to pivot when hitting line
 
 // ==================== STATE ====================
 
@@ -75,6 +76,17 @@ int calibratedBlack = 0;
 bool isCalibrated = false;
 unsigned long whiteStartTime = 0;  // When we first went on white
 bool wasOnBlack = true;            // Track transitions
+
+// Action recording for reversal (circular buffer)
+const int ACTION_BUFFER_SIZE = 60;  // Store ~3 seconds of actions (at ~20 actions/sec)
+struct Action {
+  byte type;           // 0=none, 1=pivotRight, 2=curveLeft
+  unsigned long time;  // When action started
+};
+Action actionBuffer[ACTION_BUFFER_SIZE];
+int actionIndex = 0;
+bool isReversing = false;
+int reverseIndex = 0;
 
 // ==================== SETUP ====================
 
@@ -89,6 +101,12 @@ void setup() {
 
   // Ensure motors are stopped
   stopMotors();
+
+  // Initialize action buffer
+  for (int i = 0; i < ACTION_BUFFER_SIZE; i++) {
+    actionBuffer[i].type = 0;
+    actionBuffer[i].time = 0;
+  }
 
   // Handle EEPROM pause/run toggle
   handlePauseToggle();
@@ -219,6 +237,12 @@ void testMotors() {
 // ==================== LINE FOLLOWING ====================
 
 void followLine() {
+  // If we're in reversal mode, execute that instead
+  if (isReversing) {
+    executeReversal();
+    return;
+  }
+
   // Check if on trackable line (black OR secondary color)
   bool onLine = isOnLine();
 
@@ -226,6 +250,7 @@ void followLine() {
   if (onLine) {
     wasOnBlack = true;
     whiteStartTime = 0;  // Reset white timer
+    isReversing = false; // Cancel any reversal
   } else {
     if (wasOnBlack) {
       // Just transitioned off the line
@@ -249,7 +274,7 @@ void followLine() {
     if (onLine) {
       Serial.println("LINE(turn-L)");
     } else if (timeOffLine > WHITE_ESCALATE_MS) {
-      Serial.println("OFF(PIVOT-R!)");
+      Serial.println("OFF(REVERSE!)");
     } else {
       Serial.println("OFF(curve-R)");
     }
@@ -258,18 +283,84 @@ void followLine() {
 
   if (onLine) {
     // Hit the line - turn LEFT (away from line, back to white on right)
-    // Use minimum pivot time to ensure robot actually moves
+    recordAction(1);  // Record pivotRight action
     pivotRight();
     delay(MIN_PIVOT_MS);
   } else {
     // Off line - turn toward the line (which is on our left)
     if (timeOffLine > WHITE_ESCALATE_MS) {
-      // Been off line too long (sharp turn?) - aggressive pivot to find line
-      pivotLeft();
+      // Been off line too long - start reversal sequence
+      Serial.println("*** STARTING REVERSAL ***");
+      startReversal();
     } else {
       // Normal curve toward line
+      recordAction(2);  // Record curveLeft action
       curveLeft();
     }
+  }
+}
+
+// Record an action to the circular buffer
+void recordAction(byte actionType) {
+  actionBuffer[actionIndex].type = actionType;
+  actionBuffer[actionIndex].time = millis();
+  actionIndex = (actionIndex + 1) % ACTION_BUFFER_SIZE;
+}
+
+// Start the reversal sequence
+void startReversal() {
+  isReversing = true;
+  reverseIndex = (actionIndex - 1 + ACTION_BUFFER_SIZE) % ACTION_BUFFER_SIZE;
+
+  // Find how many actions to reverse (last 3 seconds worth)
+  unsigned long cutoffTime = millis() - WHITE_ESCALATE_MS;
+  int count = 0;
+  int idx = reverseIndex;
+  while (count < ACTION_BUFFER_SIZE) {
+    if (actionBuffer[idx].time < cutoffTime || actionBuffer[idx].type == 0) {
+      break;
+    }
+    count++;
+    idx = (idx - 1 + ACTION_BUFFER_SIZE) % ACTION_BUFFER_SIZE;
+  }
+
+  Serial.print("Reversing ");
+  Serial.print(count);
+  Serial.println(" actions");
+}
+
+// Execute one step of the reversal
+void executeReversal() {
+  unsigned long cutoffTime = millis() - WHITE_ESCALATE_MS - 1000; // Extra buffer
+
+  // Check if this action is recent enough
+  if (actionBuffer[reverseIndex].time < cutoffTime || actionBuffer[reverseIndex].type == 0) {
+    // Done reversing
+    Serial.println("*** REVERSAL COMPLETE ***");
+    isReversing = false;
+    whiteStartTime = millis();  // Reset timer
+    return;
+  }
+
+  // Execute OPPOSITE action
+  byte originalAction = actionBuffer[reverseIndex].type;
+  if (originalAction == 1) {
+    // Original was pivotRight, do pivotLeft
+    pivotLeft();
+    delay(MIN_PIVOT_MS);
+  } else if (originalAction == 2) {
+    // Original was curveLeft, do curveRight (backup)
+    driveBackward();
+    delay(30);
+  }
+
+  // Move to previous action
+  reverseIndex = (reverseIndex - 1 + ACTION_BUFFER_SIZE) % ACTION_BUFFER_SIZE;
+
+  // Check if we found the line during reversal
+  if (isOnLine()) {
+    Serial.println("*** FOUND LINE DURING REVERSAL ***");
+    isReversing = false;
   }
 }
 
@@ -278,14 +369,14 @@ void followLine() {
 void handleObstacle() {
   Serial.println("");
   Serial.println("*** OBSTACLE DETECTED ***");
-  Serial.println("Taking detour to the right...");
+  Serial.println("Detouring RIGHT (off track)...");
 
   // Stop
   stopMotors();
   delay(100);
 
-  // Pivot RIGHT physically (away from line, into open space)
-  // pivotLeft() produces physical right turn due to motor wiring
+  // Turn RIGHT physically (away from track, into open space)
+  // pivotLeft() produces physical RIGHT turn due to motor wiring
   pivotLeft();
   delay(DETOUR_PIVOT_MS);
 
@@ -293,9 +384,11 @@ void handleObstacle() {
   driveForward();
   delay(DETOUR_FORWARD_MS);
 
+  // Turn back LEFT toward track
+  pivotRight();  // pivotRight() produces physical LEFT turn
+  delay(DETOUR_PIVOT_MS / 2);  // Half turn back toward track
+
   // Resume normal line following
-  // Robot is on white far to the right, line is to the left
-  // curveLeft() will bring it back toward the line
   Serial.println("Resuming line following...");
   Serial.println("");
 }
@@ -321,37 +414,47 @@ void stopMotors() {
 }
 
 void driveForward() {
-  // Both motors forward, same speed
+  // Both motors forward (left reduced to prevent right drift)
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
-  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENA, BASE_SPEED - LEFT_MOTOR_REDUCTION);
+  analogWrite(ENB, BASE_SPEED + RIGHT_MOTOR_BOOST);
+}
+
+void driveBackward() {
+  // Both motors backward (left reduced to prevent drift)
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, BASE_SPEED - LEFT_MOTOR_REDUCTION);
   analogWrite(ENB, BASE_SPEED + RIGHT_MOTOR_BOOST);
 }
 
 void curveLeft() {
-  // Both motors forward, left MUCH slower (sharp return to line)
+  // Both motors forward, left slower (curve toward line)
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
-  analogWrite(ENA, BASE_SPEED - RETURN_TURN_REDUCTION);
+  analogWrite(ENA, BASE_SPEED - RETURN_TURN_REDUCTION - LEFT_MOTOR_REDUCTION);
   analogWrite(ENB, BASE_SPEED + RIGHT_MOTOR_BOOST);
 }
 
 void curveRight() {
-  // Both motors forward, right MUCH slower (sharp return to line)
+  // Both motors forward, right slower
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
-  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENA, BASE_SPEED - LEFT_MOTOR_REDUCTION);
   analogWrite(ENB, BASE_SPEED - RETURN_TURN_REDUCTION + RIGHT_MOTOR_BOOST);
 }
 
 void sharpLeft() {
-  // Left wheel STOPPED, right wheel forward (sharp but not spinning)
+  // Left wheel STOPPED, right wheel forward
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH);
@@ -366,7 +469,7 @@ void pivotLeft() {
   digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
-  analogWrite(ENA, PIVOT_SPEED);
+  analogWrite(ENA, PIVOT_SPEED - LEFT_MOTOR_REDUCTION);
   analogWrite(ENB, PIVOT_SPEED + RIGHT_MOTOR_BOOST);
 }
 
@@ -376,7 +479,7 @@ void pivotRight() {
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, HIGH);
-  analogWrite(ENA, PIVOT_SPEED);
+  analogWrite(ENA, PIVOT_SPEED - LEFT_MOTOR_REDUCTION);
   analogWrite(ENB, PIVOT_SPEED + RIGHT_MOTOR_BOOST);
 }
 
@@ -399,33 +502,34 @@ int readColorSensor() {
   digitalWrite(CS_S2, HIGH);
   digitalWrite(CS_S3, LOW);
 
-  // Delay for filter to settle (needs ~10ms)
-  delay(10);
+  // Delay for filter to settle
+  delay(5);
 
   // Read pulse width (higher = darker)
-  return pulseIn(CS_OUT, LOW, 50000);
+  return pulseIn(CS_OUT, LOW, 30000);
 }
 
 // Read individual color channels (lower value = more of that color)
+// Reduced delays for faster response
 int readRedChannel() {
   digitalWrite(CS_S2, LOW);
   digitalWrite(CS_S3, LOW);
-  delay(5);
-  return pulseIn(CS_OUT, LOW, 50000);
+  delay(2);
+  return pulseIn(CS_OUT, LOW, 20000);
 }
 
 int readGreenChannel() {
   digitalWrite(CS_S2, HIGH);
   digitalWrite(CS_S3, HIGH);
-  delay(5);
-  return pulseIn(CS_OUT, LOW, 50000);
+  delay(2);
+  return pulseIn(CS_OUT, LOW, 20000);
 }
 
 int readBlueChannel() {
   digitalWrite(CS_S2, LOW);
   digitalWrite(CS_S3, HIGH);
-  delay(5);
-  return pulseIn(CS_OUT, LOW, 50000);
+  delay(2);
+  return pulseIn(CS_OUT, LOW, 20000);
 }
 
 bool isBlack(int value) {
@@ -455,25 +559,47 @@ bool isSecondaryColorDetected() {
     return false;
   }
 
+  // Debug: print RGB values occasionally
+  static unsigned long lastRGBPrint = 0;
+  if (millis() - lastRGBPrint > 500) {
+    Serial.print("RGB: R=");
+    Serial.print(red);
+    Serial.print(" G=");
+    Serial.print(green);
+    Serial.print(" B=");
+    Serial.println(blue);
+    lastRGBPrint = millis();
+  }
+
   // For TCS3200: LOWER pulse width = MORE of that color
-  // So we check if the target color has a significantly LOWER value
+  // Check if target color value is significantly lower than others
+  // Using multiplication instead of division for clearer logic
+
+  bool detected = false;
 
   switch (SECONDARY_COLOR) {
     case 1:  // RED
-      // Red must be significantly lower (stronger) than green and blue
-      return (red < green / COLOR_DOMINANCE) && (red < blue / COLOR_DOMINANCE);
+      // Red value must be much lower than green and blue
+      // red * dominance < green AND red * dominance < blue
+      detected = (red * COLOR_DOMINANCE < green) && (red * COLOR_DOMINANCE < blue);
+      break;
 
     case 2:  // GREEN
-      // Green must be significantly lower (stronger) than red and blue
-      return (green < red / COLOR_DOMINANCE) && (green < blue / COLOR_DOMINANCE);
+      // Green value must be much lower than red and blue
+      detected = (green * COLOR_DOMINANCE < red) && (green * COLOR_DOMINANCE < blue);
+      break;
 
     case 3:  // BLUE
-      // Blue must be significantly lower (stronger) than red and green
-      return (blue < red / COLOR_DOMINANCE) && (blue < green / COLOR_DOMINANCE);
-
-    default:
-      return false;
+      // Blue value must be much lower than red and green
+      detected = (blue * COLOR_DOMINANCE < red) && (blue * COLOR_DOMINANCE < green);
+      break;
   }
+
+  if (detected) {
+    Serial.println("*** SECONDARY COLOR DETECTED ***");
+  }
+
+  return detected;
 }
 
 // Combined check: is the sensor on a trackable line (black OR secondary color)
